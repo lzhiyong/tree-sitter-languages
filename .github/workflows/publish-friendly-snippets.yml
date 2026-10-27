@@ -1,0 +1,155 @@
+name: Publish friendly-snippets
+
+on:
+  schedule:
+    # Check upstream for snippets changes every 6 hours
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild and upload even if upstream has no changes"
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/publish-friendly-snippets.yml"
+
+permissions:
+  contents: write
+
+# Avoid two runs editing the same release at the same time
+concurrency:
+  group: release-android-tree-sitter
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: rafamadriz/friendly-snippets
+  TAG: android-tree-sitter
+  TITLE: android-tree-sitter
+  ASSET: tree-sitter-snippets.zip
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get latest upstream commit touching snippets/
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Only the most recent commit that modified the snippets/ directory
+          json=$(gh api "repos/${UPSTREAM}/commits?path=snippets&per_page=1" --jq '.[0]')
+          {
+            echo "sha=$(jq -r '.sha' <<<"$json")"
+            echo "url=$(jq -r '.html_url' <<<"$json")"
+            echo "date=$(jq -r '.commit.committer.date' <<<"$json")"
+            echo "author=$(jq -r '.commit.author.name' <<<"$json")"
+          } >> "$GITHUB_OUTPUT"
+          # Commit messages may contain special characters, so use a multiline delimiter
+          {
+            echo "message<<__EOF__"
+            jq -r '.commit.message' <<<"$json"
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check if update is needed
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ github.event_name == 'push' || inputs.force }}
+        run: |
+          # The last packaged upstream SHA is stored in a hidden marker inside our own
+          # section of the release notes
+          old=$(gh release view "$TAG" --json body --jq '.body' 2>/dev/null \
+                | grep -oP 'friendly-snippets:start sha=\K[0-9a-f]{40}' || true)
+          echo "old=${old:-none} new=${{ steps.upstream.outputs.sha }}"
+          if [ "$FORCE" = "true" ] || [ "$old" != "${{ steps.upstream.outputs.sha }}" ]; then
+            echo "update=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "update=false" >> "$GITHUB_OUTPUT"
+            echo "No snippets changes upstream, skipping."
+          fi
+
+      - name: Clone upstream
+        if: steps.check.outputs.update == 'true'
+        run: git clone --depth 1 "https://github.com/${UPSTREAM}.git" upstream
+
+      - name: Create zip
+        if: steps.check.outputs.update == 'true'
+        run: |
+          cd upstream
+          zip -r "../${ASSET}" snippets package.json LICENSE
+          cd ..
+          unzip -l "${ASSET}" | tail -n 1
+
+      - name: Build release notes (replace only our own section)
+        if: steps.check.outputs.update == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.upstream.outputs.sha }}
+          URL: ${{ steps.upstream.outputs.url }}
+          DATE: ${{ steps.upstream.outputs.date }}
+          AUTHOR: ${{ steps.upstream.outputs.author }}
+          MESSAGE: ${{ steps.upstream.outputs.message }}
+        run: |
+          # 1) Our section: always only the latest upstream commit
+          {
+            echo "<!-- friendly-snippets:start sha=${SHA} -->"
+            echo "### friendly-snippets"
+            echo
+            echo "Latest upstream commit of https://github.com/${UPSTREAM}/tree/main/snippets"
+            echo
+            echo "- Commit: [${SHA:0:7}](${URL})"
+            echo "- Author: ${AUTHOR}"
+            echo "- Date: ${DATE}"
+            echo
+            echo '```'
+            printf '%s\n' "$MESSAGE"
+            echo '```'
+            echo "<!-- friendly-snippets:end -->"
+          } > block.md
+
+          # 2) Fetch the current notes (written by this and/or other workflows)
+          gh release view "$TAG" --json body --jq '.body' > old_notes.md 2>/dev/null || : > old_notes.md
+
+          # 3) Replace our section if present, otherwise append it; leave everything else untouched
+          python3 - <<'PY'
+          import pathlib, re
+
+          old = pathlib.Path("old_notes.md").read_text()
+          block = pathlib.Path("block.md").read_text().strip()
+          pattern = re.compile(
+              r"<!-- friendly-snippets:start.*?<!-- friendly-snippets:end -->", re.S
+          )
+
+          if pattern.search(old):
+              new = pattern.sub(lambda m: block, old, count=1)
+          elif re.search(r"<!-- [\w-]+:start", old):
+              new = old.rstrip() + "\n\n" + block + "\n"
+          else:
+              # Empty or legacy (pre-marker) notes: replace entirely
+              new = block + "\n"
+
+          pathlib.Path("notes.md").write_text(new)
+          PY
+
+      - name: Create or update release (overwrite asset)
+        if: steps.check.outputs.update == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # --clobber only replaces the asset with the same name; other assets are untouched
+            gh release upload "$TAG" "$ASSET" --clobber
+            # Notes only; title and latest flag are left as other workflows set them
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" "$ASSET" \
+              --title "$TITLE" \
+              --notes-file notes.md \
+              --latest
+          fi

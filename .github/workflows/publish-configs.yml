@@ -1,0 +1,108 @@
+# Packages config/filetypes.json and the themes/ directory into tree-sitter-configs.zip and uploads
+# it to the "android-tree-sitter" release whenever either of them changes.
+# The release/tag is created once; later runs only overwrite the asset and replace the notes.
+name: Publish tree-sitter configs
+
+on:
+  push:
+    branches: [main]
+    paths:                  # Runs only when one of these files changes (add, edit or delete)
+      - config/filetypes.json
+      - themes/**
+      - .github/workflows/publish-configs.yml
+  workflow_dispatch:        # Allow manual runs from the Actions tab
+
+# Required to create the release and upload assets
+permissions:
+  contents: write
+
+# Run one publish at a time so concurrent pushes don't race on the same release
+concurrency:
+  group: publish-configs
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: android-tree-sitter   # Shared with build-parsers.yml and sync-parsers.yml
+  ZIP_NAME: tree-sitter-configs.zip
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}   # Auth for the gh CLI
+    steps:
+      - uses: actions/checkout@v4
+
+      # Zip layout: the paths are stored as they are in the repo, so the archive contains
+      # config/filetypes.json and themes/...
+      - name: Package configs
+        run: |
+          if [ ! -f config/filetypes.json ]; then
+            echo "config/filetypes.json not found" >&2
+            exit 1
+          fi
+          if [ ! -d themes ]; then
+            echo "themes/ directory not found" >&2
+            exit 1
+          fi
+          rm -f "$ZIP_NAME"
+          zip -qr -9 "$ZIP_NAME" config/filetypes.json themes
+          unzip -l "$ZIP_NAME"   # Show the contents in the log
+
+      - name: Publish to GitHub Releases
+        run: |
+          TAG="$RELEASE_TAG"
+          SECTION=publish-configs   # Marker id of the release-notes section owned by this workflow
+          W=$(mktemp -d)
+
+          # Our section: only the latest commit, replaced (not appended) on every run
+          {
+            printf '### Configs - %s\n' "$(date -u +'%F %H:%M UTC')"
+            git log -1 --pretty=format:"- %s (%h)" "$GITHUB_SHA"
+            echo
+          } > "$W/section.md"
+
+          # The release notes are shared with the other workflows (build-parsers.yml,
+          # sync-parsers.yml, ...). Each one owns a section delimited by
+          # <!-- id:start --> ... <!-- id:end -->; only our own section is replaced and
+          # everything else is kept. Notes without any marker (old format) are replaced entirely.
+          merge_notes() {
+            gh release view "$TAG" --json body --jq '.body' > "$W/old.md" 2>/dev/null || : > "$W/old.md"
+            SECTION="$SECTION" W="$W" python3 - <<'PY'
+          import os, pathlib, re
+          w = pathlib.Path(os.environ["W"])
+          sec = os.environ["SECTION"]
+          old = (w / "old.md").read_text()
+          body = (w / "section.md").read_text().strip()
+          block = f"<!-- {sec}:start -->\n{body}\n<!-- {sec}:end -->"
+          own = re.compile(rf"<!-- {re.escape(sec)}:start -->.*?<!-- {re.escape(sec)}:end -->", re.S)
+          if own.search(old):
+              new = own.sub(lambda m: block, old, count=1)
+          elif re.search(r"<!-- [\w-]+:start", old):
+              new = old.rstrip() + "\n\n" + block + "\n"
+          else:
+              new = block + "\n"
+          (w / "notes.md").write_text(new)
+          PY
+          }
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # Release exists: keep the tag untouched, overwrite the asset, replace only our notes section
+            gh release upload "$TAG" "$ZIP_NAME" --clobber
+            HEADER=$(head -n1 "$W/section.md")
+            for attempt in 1 2 3; do
+              merge_notes
+              gh release edit "$TAG" --notes-file "$W/notes.md"
+              # Re-read to make sure a concurrent workflow did not overwrite our update
+              sleep 3
+              gh release view "$TAG" --json body --jq '.body' | grep -qF "$HEADER" && break
+              echo "Release notes changed concurrently, retrying ($attempt)..." >&2
+            done
+          else
+            # First run: create the tag and the release once
+            merge_notes
+            gh release create "$TAG" "$ZIP_NAME" \
+              --target "$GITHUB_SHA" \
+              --title "$TAG" \
+              --notes-file "$W/notes.md"
+          fi
